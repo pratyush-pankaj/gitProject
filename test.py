@@ -1,2 +1,2 @@
 if 5 == 5:
-    print("Same")
+    print("For conflict")
