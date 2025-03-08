@@ -1,6 +1,4 @@
-a = 10
-if 5 == 5:
-    print("For conflict")
+a = 15
 
 for i in range(0,a):
     print("ronny")
