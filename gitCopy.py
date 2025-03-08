@@ -42,48 +42,56 @@ def get_latest_commit(branch: str) -> Optional[Dict]:
     - commit hash
     - timestamp
     - message
-    - list of affected files
+    - affected files
+    - developer name
     Returns None if there are no commits or an error occurs.
     """
-    output = run_git_command(["log", branch, "-1", "--pretty=format:%H|%ct|%s"])
+    output = run_git_command(["log", branch, "-1", "--pretty=format:%H|%ct|%s|%an"])
     if output:
         try:
-            commit_hash, timestamp, message = output.split("|", 2)
-            # Get affected files
+            commit_hash, timestamp, message, author = output.split("|", 3)
             files_output = run_git_command(["diff-tree", "--no-commit-id", "--name-only", "-r", commit_hash])
             affected_files = files_output.splitlines() if files_output else []
             return {
                 "hash": commit_hash,
                 "timestamp": int(timestamp),
                 "message": message,
-                "files": affected_files
+                "files": affected_files,
+                "developer": author
             }
         except ValueError:
             logging.error("Error parsing commit output.")
     return None
 
-def get_latest_push_event() -> Optional[Dict]:
+def get_latest_push_events(remote: str = "origin") -> List[Dict]:
     """
-    Detects the latest push event using 'git reflog' and returns:
+    Detects push events by comparing the local and remote HEAD of each branch.
+    Returns a list of push events with:
     - branch name
-    - timestamp
-    If no push is detected, returns None.
+    - timestamp (current time)
+    - developer (last committer)
     """
-    output = run_git_command(["reflog", "show", "--format=%gd|%ct", "--grep-reflog", "push"])
-    if output:
-        lines = output.splitlines()
-        for line in lines:
-            try:
-                branch_info, timestamp = line.split("|")
-                branch = branch_info.replace("HEAD@", "").strip()
-                return {
-                    "event_type": "push",
-                    "branch": branch,
-                    "timestamp": int(timestamp)
-                }
-            except ValueError:
-                logging.error("Error parsing push event.")
-    return None
+    push_events = []
+    branches = get_current_branches()
+    
+    for branch in branches:
+        remote_commit = run_git_command(["ls-remote", remote, f"refs/heads/{branch}"])
+        if not remote_commit:
+            continue
+        
+        remote_hash = remote_commit.split()[0]
+        local_commit = run_git_command(["rev-parse", branch])
+        
+        if remote_hash != local_commit:
+            developer = run_git_command(["log", branch, "-1", "--pretty=format:%an"])
+            push_events.append({
+                "event_type": "push",
+                "branch": branch,
+                "timestamp": int(time.time()),
+                "developer": developer
+            })
+    
+    return push_events
 
 def log_event(event: Dict):
     """Logs the event to git_events.json."""
@@ -108,13 +116,15 @@ async def monitor_repo(poll_interval: int = POLL_INTERVAL_DEFAULT):
             # Detect new branches
             new_branches = current_branches - known_branches
             for branch in new_branches:
+                developer = run_git_command(["log", branch, "-1", "--pretty=format:%an"]) or "Unknown"
                 event_data = {
                     "event_type": "branch_creation",
                     "branch": branch,
-                    "timestamp": int(time.time())
+                    "timestamp": int(time.time()),
+                    "developer": developer
                 }
                 log_event(event_data)
-                logging.info(f"Detected new branch: {branch}")
+                logging.info(f"Detected new branch: {branch} by {developer}")
                 
                 # Initialize commit tracking for new branch
                 commit = get_latest_commit(branch)
@@ -139,17 +149,18 @@ async def monitor_repo(poll_interval: int = POLL_INTERVAL_DEFAULT):
                         "commit_hash": commit["hash"],
                         "commit_message": commit["message"],
                         "commit_timestamp": commit["timestamp"],
-                        "affected_files": commit["files"]
+                        "affected_files": commit["files"],
+                        "developer": commit["developer"]
                     }
                     log_event(event_data)
-                    logging.info(f"New commit on {branch}: {commit['hash']} | Files: {commit['files']}")
+                    logging.info(f"New commit on {branch}: {commit['hash']} by {commit['developer']} | Files: {commit['files']}")
                     branch_commits[branch] = commit["hash"]
 
             # Detect push events
-            push_event = get_latest_push_event()
-            if push_event:
+            push_events = get_latest_push_events()
+            for push_event in push_events:
                 log_event(push_event)
-                logging.info(f"Detected push on branch {push_event['branch']}")
+                logging.info(f"Detected push on branch {push_event['branch']} by {push_event['developer']}")
 
         except Exception as e:
             logging.error(f"Error during monitoring: {str(e)}")
@@ -167,8 +178,7 @@ def start_monitoring(poll_interval: int):
     finally:
         loop.close()
 
-def generate_report(developer: Optional[str] = None, event_type: Optional[str] = None,
-                    start_date: Optional[int] = None, end_date: Optional[int] = None):
+def generate_report(event_type: Optional[str] = None):
     """Generates a report from the log file based on the given filters."""
     if not os.path.exists(LOG_FILE):
         print("No log file found. Have you run 'monitor' yet?")
@@ -188,15 +198,6 @@ def generate_report(developer: Optional[str] = None, event_type: Optional[str] =
 
                 if event_type and event.get("event_type") != event_type:
                     continue
-
-                event_logged_at = event.get("logged_at", 0)
-                if start_date and event_logged_at < start_date:
-                    continue
-                if end_date and event_logged_at > end_date:
-                    continue
-
-                if developer:
-                    pass  # Placeholder for future developer filtering logic
                 
                 events.append(event)
     except Exception as e:
@@ -208,11 +209,8 @@ def generate_report(developer: Optional[str] = None, event_type: Optional[str] =
 def validate_repo_path(path: str) -> str:
     """Validates that the provided path is a Git repository."""
     abs_path = os.path.abspath(path)
-    if not os.path.isdir(abs_path):
-        logging.error("Provided repository path does not exist or is not a directory.")
-        sys.exit(1)
-    if not os.path.isdir(os.path.join(abs_path, ".git")):
-        logging.error("Provided path is not a valid Git repository (missing .git folder).")
+    if not os.path.isdir(abs_path) or not os.path.isdir(os.path.join(abs_path, ".git")):
+        logging.error("Provided path is not a valid Git repository.")
         sys.exit(1)
     return abs_path
 
@@ -222,22 +220,15 @@ def main():
     
     monitor_parser = subparsers.add_parser("monitor", help="Start monitoring the Git repository")
     monitor_parser.add_argument("--interval", type=int, default=POLL_INTERVAL_DEFAULT, help="Polling interval in seconds")
-    monitor_parser.add_argument("--repo", type=str, default=os.getcwd(), help="Path to the Git repository")
 
     report_parser = subparsers.add_parser("report", help="Generate a report from the log file")
-    report_parser.add_argument("--event_type", type=str, help="Filter by event type (e.g., branch_creation, commit, push)")
-    
-    args = parser.parse_args()
-    global REPO_PATH
-    REPO_PATH = validate_repo_path(args.repo)
+    report_parser.add_argument("--event_type", type=str, help="Filter by event type (commit, push, branch_creation)")
 
+    args = parser.parse_args()
     if args.command == "monitor":
         threading.Thread(target=start_monitoring, args=(args.interval,), daemon=True).start()
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logging.info("Exiting monitoring mode.")
+        while True:
+            time.sleep(1)
     elif args.command == "report":
         generate_report(event_type=args.event_type)
 
