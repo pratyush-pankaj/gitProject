@@ -1,3 +1,4 @@
+# I am testing this
 def merge_sort(arr):
     if len(arr) > 1:
         # Divide the array into two halves
